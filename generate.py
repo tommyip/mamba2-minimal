@@ -6,16 +6,18 @@ from mamba2 import Mamba2LMHeadModel
 
 torch.manual_seed(42)
 
+device = torch.device("mps")  # cpu, cuda, mps
+
 PROMPT = "My model cutoff date is"
 MAX_LEN = 50
 TOP_K = 1
 
-model = Mamba2LMHeadModel.from_pretrained("state-spaces/mamba2-130m")
+model = Mamba2LMHeadModel.from_pretrained("state-spaces/mamba2-130m", device=device)
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
 tokens = tokenizer(PROMPT, return_tensors="pt")
-input_ids = tokens.input_ids
+input_ids = tokens.input_ids.to(device)
 print(tokenizer.decode(input_ids.tolist()[0]), end="")
 
 for _ in range(MAX_LEN):
@@ -32,7 +34,7 @@ for _ in range(MAX_LEN):
 
     input_ids = torch.cat((input_ids, next_index.unsqueeze(0)), dim=-1)
 
-    output = tokenizer.decode(next_index)
+    output = tokenizer.decode(next_index.tolist())
     print(output, end="", flush=True)
 
 print()

@@ -1,11 +1,13 @@
 import json
 from dataclasses import dataclass
-from typing import cast
+from typing import TypeAlias, cast
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import LongTensor, Tensor, nn
+
+Device: TypeAlias = str | torch.device | None
 
 
 @dataclass
@@ -35,32 +37,34 @@ class Mamba2Config:
 
 
 class Mamba2LMHeadModel(nn.Module):
-    def __init__(self, args: Mamba2Config):
+    def __init__(self, args: Mamba2Config, device: Device = None):
         super().__init__()
         self.args = args
 
         self.backbone = nn.ModuleDict(
             dict(
-                embedding=nn.Embedding(args.vocab_size, args.d_model),
+                embedding=nn.Embedding(args.vocab_size, args.d_model, device=device),
                 layers=nn.ModuleList(
                     [
                         nn.ModuleDict(
                             dict(
-                                mixer=Mamba2(args),
-                                norm=RMSNorm(args.d_model),
+                                mixer=Mamba2(args, device=device),
+                                norm=RMSNorm(args.d_model, device=device),
                             )
                         )
                         for _ in range(args.n_layer)
                     ]
                 ),
-                norm_f=RMSNorm(args.d_model),
+                norm_f=RMSNorm(args.d_model, device=device),
             )
         )
-        self.lm_head = nn.Linear(args.d_model, args.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            args.d_model, args.vocab_size, bias=False, device=device
+        )
         self.lm_head.weight = self.backbone.embedding.weight
 
     @staticmethod
-    def from_pretrained(huggingface_model_id: str):
+    def from_pretrained(huggingface_model_id: str, device: Device = None):
         from transformers.utils import CONFIG_NAME, WEIGHTS_NAME
         from transformers.utils.hub import cached_file
 
@@ -77,10 +81,11 @@ class Mamba2LMHeadModel(nn.Module):
             pad_vocab_size_multiple=config["pad_vocab_size_multiple"],
         )
 
+        map_location = "cpu" if device is None else device
         state_dict = torch.load(
-            state_dict_path, weights_only=True, map_location="cpu", mmap=True
+            state_dict_path, weights_only=True, map_location=map_location, mmap=True
         )
-        model = Mamba2LMHeadModel(args)
+        model = Mamba2LMHeadModel(args, device=device)
         model.load_state_dict(state_dict)
         return model
 
@@ -109,13 +114,14 @@ class Mamba2LMHeadModel(nn.Module):
 
 
 class Mamba2(nn.Module):
-    def __init__(self, args: Mamba2Config):
+    def __init__(self, args: Mamba2Config, device: Device = None):
         super().__init__()
         self.args = args
+        self.device = device
 
         # Order: (z, x, B, C, dt)
         d_in_proj = 2 * args.d_inner + 2 * args.ngroups * args.d_state + args.nheads
-        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=args.bias)
+        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=args.bias, device=device)
 
         conv_dim = args.d_inner + 2 * args.ngroups * args.d_state
         self.conv1d = nn.Conv1d(
@@ -125,14 +131,16 @@ class Mamba2(nn.Module):
             kernel_size=args.d_conv,
             groups=conv_dim,
             padding=args.d_conv - 1,
+            device=device,
         )
 
-        self.act = nn.SiLU()
-        self.dt_bias = nn.Parameter(torch.empty(args.nheads))
-        self.A_log = nn.Parameter(torch.empty(args.nheads))
-        self.D = nn.Parameter(torch.empty(args.nheads))
-        self.norm = RMSNorm(args.d_inner)
-        self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=args.bias)
+        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        self.norm = RMSNorm(args.d_inner, device=device)
+        self.out_proj = nn.Linear(
+            args.d_inner, args.d_model, bias=args.bias, device=device
+        )
 
     def forward(self, u):
         """
@@ -153,7 +161,7 @@ class Mamba2(nn.Module):
             dim=-1,
         )
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
-        xBC = self.act(
+        xBC = silu(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen, :]
         )  # (batch, seqlen, d_inner + 2 * ngroups * d_state))
         x, B, C = torch.split(
@@ -174,6 +182,7 @@ class Mamba2(nn.Module):
             rearrange(C, "b l (g n) -> b l g n", g=self.args.ngroups),
             self.D,
             self.args.chunk_size,
+            device=self.device,
         )
         y = rearrange(y, "b l h p -> b l (h p)")
 
@@ -181,22 +190,22 @@ class Mamba2(nn.Module):
         return self.out_proj(y)
 
 
-def segsum(x: Tensor) -> Tensor:
+def segsum(x: Tensor, device: Device = None) -> Tensor:
     """More stable segment sum calculation.
 
     Source: https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L23-L32
     """
     T = x.size(-1)
     x = repeat(x, "... d -> ... d e", e=T)
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool), diagonal=-1)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
     x = x.masked_fill(~mask, 0)
     x_segsum = torch.cumsum(x, dim=-2)
-    mask = torch.tril(torch.ones(T, T, dtype=torch.bool), diagonal=0)
+    mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
 
 
-def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None):
+def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None, device: Device = None):
     """
     x: (batch, seqlen, n_heads, d_head)
     dt: (batch, seqlen, n_heads)
@@ -224,7 +233,7 @@ def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None):
     A_cumsum = torch.cumsum(A, dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
-    L = torch.exp(segsum(A))
+    L = torch.exp(segsum(A, device=device))
     Y_diag = torch.einsum("bclhn, bcshn, bhcls, bcshp -> bclhp", C, B, L, x)
 
     # 2. Compute the state for each intra-chunk
@@ -237,7 +246,7 @@ def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None):
     if initial_states is None:
         initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
@@ -255,12 +264,20 @@ def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-5):
+    def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
+        self.weight = nn.Parameter(torch.ones(d, device=device))
 
     def forward(self, x, z=None):
         if z is not None:
-            x = x * F.silu(z)
+            x = x * silu(z)
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+def silu(x):
+    """Applies the Sigmoid Linear Unit (SiLU), element-wise.
+
+    Define this manually since torch's version doesn't seem to work on MPS.
+    """
+    return x * F.sigmoid(x)
