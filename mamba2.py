@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from typing import TypeAlias, cast
+from typing import Iterable, TypeAlias, cast
 
 import torch
 import torch.nn.functional as F
@@ -87,6 +87,7 @@ class Mamba2LMHeadModel(nn.Module):
         )
         model = Mamba2LMHeadModel(args, device=device)
         model.load_state_dict(state_dict)
+        model.eval()
         return model
 
     def forward(self, input_ids: LongTensor) -> LongTensor:
@@ -111,6 +112,38 @@ class Mamba2LMHeadModel(nn.Module):
         h = self.backbone.norm_f(h)
         logits = self.lm_head(h)
         return logits[:, :seqlen]
+
+    def generate(
+        self,
+        input_ids: LongTensor,
+        max_new_length: int = 20,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        eos_token_id: int = 0,
+    ) -> Iterable[int]:
+        tokens = input_ids.unsqueeze(0)
+        for _ in range(max_new_length):
+            logits = self(tokens)[0, -1]
+            if temperature != 1.0:
+                logits = logits / temperature
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, k=top_k)[0][-1]
+                logits[indices_to_remove] = -torch.inf
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cum_probs > 0.5
+                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+                sorted_indices_to_remove[0] = False
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                logits[indices_to_remove] = -torch.inf
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            if next_token.item() == eos_token_id:
+                return
+            tokens = torch.cat((tokens, next_token.unsqueeze(0)), dim=-1)
+            yield cast(int, next_token.item())
 
 
 class Mamba2(nn.Module):
