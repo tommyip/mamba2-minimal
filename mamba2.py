@@ -1,3 +1,14 @@
+"""
+mamba2-minimal
+==============
+
+A minimal, single-file implementation of the Mamba-2 model in PyTorch.
+
+> **Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality**
+> Authors: Tri Dao, Albert Gu
+> Paper: https://arxiv.org/abs/2405.21060
+"""
+
 import json
 from dataclasses import dataclass
 from typing import Iterable, TypeAlias, cast
@@ -12,18 +23,15 @@ Device: TypeAlias = str | torch.device | None
 
 @dataclass
 class Mamba2Config:
-    d_model: int
-    n_layer: int
-    vocab_size: int
+    d_model: int  # model dimension (D)
+    n_layer: int = 24  # number of Mamba-2 layers in the language model
+    d_state: int = 128  # state dimension (N)
+    d_conv: int = 4  # convolution kernel size
+    expand: int = 2  # expansion factor (E)
+    headdim: int = 64  # head dimension (P)
+    chunk_size: int = 64  # matrix partition size (Q)
+    vocab_size: int = 50277
     pad_vocab_size_multiple: int = 16
-    d_state: int = 128
-    d_conv: int = 4
-    expand: int = 2
-    headdim: int = 64
-    ngroups: int = 1
-    chunk_size: int = 64
-    bias: bool = False
-    conv_bias: bool = True
 
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
@@ -153,14 +161,13 @@ class Mamba2(nn.Module):
         self.device = device
 
         # Order: (z, x, B, C, dt)
-        d_in_proj = 2 * args.d_inner + 2 * args.ngroups * args.d_state + args.nheads
-        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=args.bias, device=device)
+        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
+        self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
 
-        conv_dim = args.d_inner + 2 * args.ngroups * args.d_state
+        conv_dim = args.d_inner + 2 * args.d_state
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
             out_channels=conv_dim,
-            bias=args.conv_bias,
             kernel_size=args.d_conv,
             groups=conv_dim,
             padding=args.d_conv - 1,
@@ -171,24 +178,25 @@ class Mamba2(nn.Module):
         self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
         self.D = nn.Parameter(torch.empty(args.nheads, device=device))
         self.norm = RMSNorm(args.d_inner, device=device)
-        self.out_proj = nn.Linear(
-            args.d_inner, args.d_model, bias=args.bias, device=device
-        )
+        self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
     def forward(self, u):
         """
-        u: (batch, seqlen, d_model)
-        Returns (batch, seqlen, d_model)
+        Arguments
+            u: (batch, seqlen, d_model)
+
+        Return
+            y: (batch, seqlen, d_model)
         """
         _batch, seqlen, _d_model = u.shape
 
-        A = -torch.exp(self.A_log)  # (nheads,) or (d_inner, d_state)
+        A = -torch.exp(self.A_log)  # (nheads,)
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
         z, xBC, dt = torch.split(
             zxbcdt,
             [
                 self.args.d_inner,
-                self.args.d_inner + 2 * self.args.ngroups * self.args.d_state,
+                self.args.d_inner + 2 * self.args.d_state,
                 self.args.nheads,
             ],
             dim=-1,
@@ -196,27 +204,20 @@ class Mamba2(nn.Module):
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
         xBC = silu(
             self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen, :]
-        )  # (batch, seqlen, d_inner + 2 * ngroups * d_state))
+        )  # (batch, seqlen, d_inner + 2 * d_state))
         x, B, C = torch.split(
-            xBC,
-            [
-                self.args.d_inner,
-                self.args.ngroups * self.args.d_state,
-                self.args.ngroups * self.args.d_state,
-            ],
-            dim=-1,
+            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
         )
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
         y, _h = ssd(
-            x,
-            dt,
-            A,
-            rearrange(B, "b l (g n) -> b l g n", g=self.args.ngroups),
-            rearrange(C, "b l (g n) -> b l g n", g=self.args.ngroups),
-            self.D,
+            x * dt.unsqueeze(-1),
+            A * dt,
+            rearrange(B, "b l (g n) -> b l g n", g=1),
+            rearrange(C, "b l (g n) -> b l g n", g=1),
             self.args.chunk_size,
             device=self.device,
         )
+        y = y + x * self.D.unsqueeze(-1)
         y = rearrange(y, "b l h p -> b l (h p)")
 
         y = self.norm(y, z)
@@ -224,7 +225,9 @@ class Mamba2(nn.Module):
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
-    """More stable segment sum calculation.
+    """Stable segment sum calculation.
+
+    `exp(segsum(A))` produces a 1-semiseparable matrix, which is equivalent to a scalar SSM.
 
     Source: https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L23-L32
     """
@@ -238,26 +241,29 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     return x_segsum
 
 
-def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None, device: Device = None):
-    """
-    x: (batch, seqlen, n_heads, d_head)
-    dt: (batch, seqlen, n_heads)
-    A: (batch, seqlen, n_heads)
-    B: (batch, seqlen, n_heads, d_state)
-    C: (batch, seqlen, n_heads, d_state)
-    D: (nheads,)
-    Returns (batch, seqlen, n_heads, d_head)
+def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
+    """Structed State Space Duality (SSD) - the core of Mamba-2
 
-    Source: https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
+    This is almost the exact same minimal SSD code from the blog post.
+
+    Arguments
+        x: (batch, seqlen, n_heads, d_head)
+        A: (batch, seqlen, n_heads)
+        B: (batch, seqlen, n_heads, d_state)
+        C: (batch, seqlen, n_heads, d_state)
+
+    Return
+        y: (batch, seqlen, n_heads, d_head)
+
+    Source
+     1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
+     2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
     assert x.shape[1] % chunk_size == 0
 
-    xD = x * D.unsqueeze(-1)
-
-    A = A * dt
-    x = x * dt.unsqueeze(-1)
-
     # Rearrange into chunks
+    # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
+    # This is not implemented and left as an exercise for the reader 😜
     x, A, B, C = [
         rearrange(m, "b (c l) ... -> b c l ...", l=chunk_size) for m in (x, A, B, C)
     ]
@@ -291,13 +297,15 @@ def ssd(x, dt, A, B, C, D, chunk_size, initial_states=None, device: Device = Non
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
 
-    Y = Y + xD
-
     return Y, final_state
 
 
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
+        """Gated Root Mean Square Layer Normalization
+
+        Paper: https://arxiv.org/abs/1910.07467
+        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d, device=device))

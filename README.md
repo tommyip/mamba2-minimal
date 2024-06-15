@@ -8,17 +8,51 @@ A minimal, single-file implementation of the Mamba-2 model in PyTorch.
 > Tri Dao*, Albert Gu*\
 > Paper: https://arxiv.org/abs/2405.21060
 
+This implementation is device agnostic and have been tested to work on the CPU and MPS (Metal Performance Shaders) backends. The model's output logits follow the same distribution as the reference implementation but are not equal at the bit level. 
+
+## Usage
+
+Install dependencies (`torch`, `einops` and `transformers`):
+
+```
+pip install -r requirements.txt
+```
+
+See [demo.ipynb](./demo.ipynb) for using Mamba-2 as part of an end-to-end language model with pretrained weights for text generation.
+
+The core Mamba-2 model can be used as follows:
+
+```py
+import torch
+
+from mamba2 import Mamba2, Mamba2Config
+
+config = Mamba2Config(d_model=768)
+model = Mamba2(config)
+
+x = torch.randn(2, 64, 768)  # (batch, seqlen, d_model)
+y = model(x)  # same shape as x
+```
+
+
+## TODOs
+
+- [ ] Constant time (wrt sequence length) autoregressive inference
+- [ ] Remove dependency on `einops` (depends on whether resulting code is still readable)
+
 ## Credits
 
-* Albert Gu ([@albertfgu]), Tri Dao ([@tridao]) - authors of the Mamba-2 architecture
+* [Albert Gu], [Tri Dao] - authors of the Mamba-2 architecture
   * [paper]
+  * [reference implementation]
   * [blog post]
-* John Ma ([@johnma2006]) - author of [mamba-minimal], who inspired this repo
+* [John Ma] - author of [johnma2006/mamba-minimal], who inspired this repo
 
 
-[@albertfgu]: https://github.com/albertfgu
-[@tridao]: https://github.com/tridao
+[Albert Gu]: https://github.com/albertfgu
+[Tri Dao]: https://github.com/tridao
 [paper]: https://arxiv.org/abs/2405.21060
+[reference implementation]: https://github.com/state-spaces/mamba
 [blog post]: https://tridao.me/blog/2024/mamba2-part1-model/
-[@johnma2006]: https://github.com/johnma2006
-[mamba-minimal]: https://github.com/johnma2006/mamba-minimal
+[John Ma]: https://github.com/johnma2006
+[johnma2006/mamba-minimal]: https://github.com/johnma2006/mamba-minimal
