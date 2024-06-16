@@ -37,7 +37,7 @@ y = model(x)  # same shape as x
 
 ## TODOs
 
-- [ ] Constant time (wrt sequence length) autoregressive inference
+- [x] Constant time (wrt sequence length) autoregressive inference
 - [ ] Remove dependency on `einops` (depends on whether resulting code is still readable)
 
 ## Credits

@@ -11,7 +11,7 @@ A minimal, single-file implementation of the Mamba-2 model in PyTorch.
 
 import json
 from dataclasses import dataclass
-from typing import Iterable, TypeAlias, cast
+from typing import Iterable, NamedTuple, TypeAlias, cast
 
 import torch
 import torch.nn.functional as F
@@ -44,10 +44,16 @@ class Mamba2Config:
             )
 
 
+class InferenceCache(NamedTuple):
+    conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
+    ssm_state: Tensor  # (batch, nheads, headdim, d_state)
+
+
 class Mamba2LMHeadModel(nn.Module):
     def __init__(self, args: Mamba2Config, device: Device = None):
         super().__init__()
         self.args = args
+        self.device = device
 
         self.backbone = nn.ModuleDict(
             dict(
@@ -98,41 +104,59 @@ class Mamba2LMHeadModel(nn.Module):
         model.eval()
         return model
 
-    def forward(self, input_ids: LongTensor) -> LongTensor:
+    def forward(
+        self, input_ids: LongTensor, h: list[InferenceCache] | list[None] | None = None
+    ) -> tuple[LongTensor, list[InferenceCache]]:
         """
-        input_ids: (batch, seqlen)
-            tokens from `EleutherAI/gpt-neox-20b` tokenizer
-        Returns logits (batch, seqlen, vocab_size)
+        Arguments
+            input_ids: (batch, seqlen) tokens from `EleutherAI/gpt-neox-20b` tokenizer
+            h: hidden states for inference step. If present the constant-time
+               (wrt sequence length) inference path will be taken, input_ids
+               should have shape (batch, 1) containing the next batch of prompt
+               token.
+
+        Return (logits, h)
+            logits: (batch, seqlen, vocab_size)
+            h: updated inference cache after processing `input_ids`
         """
-        _batch, seqlen = input_ids.shape
+        seqlen = input_ids.shape[1]
 
-        # Pad sequence to multiples of `chunk_size`
-        chunk_excess = input_ids.shape[1] % self.args.chunk_size
-        if chunk_excess != 0:
-            input_ids = cast(
-                LongTensor, F.pad(input_ids, (0, self.args.chunk_size - chunk_excess))
-            )
+        if h is None:
+            h = [None for _ in range(self.args.n_layer)]
 
-        h = self.backbone.embedding(input_ids)
-        for layer in self.backbone.layers:
-            h = layer.mixer(layer.norm(h)) + h
+            # Pad sequence to multiples of `chunk_size` for sequence parallelism in SSD
+            chunk_excess = seqlen % self.args.chunk_size
+            if chunk_excess != 0:
+                input_ids = cast(
+                    LongTensor,
+                    F.pad(input_ids, (0, self.args.chunk_size - chunk_excess)),
+                )
 
-        h = self.backbone.norm_f(h)
-        logits = self.lm_head(h)
-        return logits[:, :seqlen]
+        x = self.backbone.embedding(input_ids)
+        for i, layer in enumerate(self.backbone.layers):
+            y, h[i] = layer.mixer(layer.norm(x), h[i])
+            x = y + x
+
+        x = self.backbone.norm_f(x)
+        logits = self.lm_head(x)
+        return logits[:, :seqlen], cast(list[InferenceCache], h)
 
     def generate(
         self,
         input_ids: LongTensor,
+        initial_state: list[InferenceCache] | None = None,
         max_new_length: int = 20,
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 1.0,
         eos_token_id: int = 0,
-    ) -> Iterable[int]:
+    ) -> Iterable[tuple[int, list[InferenceCache]]]:
         tokens = input_ids.unsqueeze(0)
+        h = initial_state
         for _ in range(max_new_length):
-            logits = self(tokens)[0, -1]
+            with torch.no_grad():
+                out, h = self(tokens, h)
+            logits = out[0, -1]
             if temperature != 1.0:
                 logits = logits / temperature
             if top_k > 0:
@@ -150,8 +174,8 @@ class Mamba2LMHeadModel(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             if next_token.item() == eos_token_id:
                 return
-            tokens = torch.cat((tokens, next_token.unsqueeze(0)), dim=-1)
-            yield cast(int, next_token.item())
+            tokens = next_token.unsqueeze(0)
+            yield cast(int, next_token.item()), h
 
 
 class Mamba2(nn.Module):
@@ -180,15 +204,18 @@ class Mamba2(nn.Module):
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
-    def forward(self, u):
+    def forward(self, u: Tensor, h: InferenceCache | None = None):
         """
         Arguments
-            u: (batch, seqlen, d_model)
+            u: (batch, seqlen, d_model) input
+            h: hidden states for inference step. Initialized to 0s if not present.
 
-        Return
-            y: (batch, seqlen, d_model)
+        Return (y, h)
+            y: (batch, seqlen, d_model) output
+            h: updated inference cache after processing `u`
         """
-        _batch, seqlen, _d_model = u.shape
+        if h:
+            return self.step(u, h)
 
         A = -torch.exp(self.A_log)  # (nheads,)
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
@@ -202,26 +229,94 @@ class Mamba2(nn.Module):
             dim=-1,
         )
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+
+        # Pad or truncate xBC seqlen to d_conv
+        conv_state = F.pad(
+            rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
+        )
+
         xBC = silu(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen, :]
+            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
         )  # (batch, seqlen, d_inner + 2 * d_state))
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
         )
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
-        y, _h = ssd(
+        y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
-            rearrange(B, "b l (g n) -> b l g n", g=1),
-            rearrange(C, "b l (g n) -> b l g n", g=1),
+            rearrange(B, "b l n -> b l 1 n"),
+            rearrange(C, "b l n -> b l 1 n"),
             self.args.chunk_size,
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
         y = rearrange(y, "b l h p -> b l (h p)")
-
         y = self.norm(y, z)
-        return self.out_proj(y)
+        y = self.out_proj(y)
+
+        h = InferenceCache(conv_state, ssm_state)
+        return y, h
+
+    def step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
+        """Take a single inference step for the current input and hidden state
+
+        Unlike attention-based models, RNN-based models (eg Mamba) does not need
+        to look back at all the past tokens to generate a new token. Instead a
+        hidden state (initialized to 0s initially) is updated for each input and
+        passed to the next inference step. This means that the total inference
+        time is linear with respect to the sequence length instead of quadratic
+        in attention's case.
+
+        Arguments
+            u: (batch, 1, d_model)
+            h: initial/running hidden state
+
+        Return (y, h)
+            y: (batch, 1, d_model)
+            h: updated hidden state
+        """
+        assert u.shape[1] == 1, "Only one token can be decoded per inference step"
+
+        zxbcdt = self.in_proj(u.squeeze(1))  # (batch, d_in_proj)
+        z, xBC, dt = torch.split(
+            zxbcdt,
+            [
+                self.args.d_inner,
+                self.args.d_inner + 2 * self.args.d_state,
+                self.args.nheads,
+            ],
+            dim=-1,
+        )
+
+        # Advance convolution input
+        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
+        h.conv_state[:, :, -1] = xBC
+        # Convolution step
+        xBC = torch.sum(
+            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+        )
+        xBC += self.conv1d.bias
+        xBC = silu(xBC)
+
+        x, B, C = torch.split(
+            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
+        )
+        A = -torch.exp(self.A_log)  # (nheads,)
+
+        # SSM step
+        dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
+        dA = torch.exp(dt * A)  # (batch, nheads)
+        x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
+        dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        y = y + rearrange(self.D, "h -> h 1") * x
+        y = rearrange(y, "b h p -> b (h p)")
+        y = self.norm(y, z)
+        y = self.out_proj(y)
+
+        return y.unsqueeze(1), h
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
