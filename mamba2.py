@@ -48,6 +48,17 @@ class InferenceCache(NamedTuple):
     conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
     ssm_state: Tensor  # (batch, nheads, headdim, d_state)
 
+    @staticmethod
+    def alloc(batch_size: int, args: Mamba2Config, device: Device = None):
+        return InferenceCache(
+            torch.zeros(
+                batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
+            ),
+            torch.zeros(
+                batch_size, args.nheads, args.headdim, args.d_state, device=device
+            ),
+        )
+
 
 class Mamba2LMHeadModel(nn.Module):
     def __init__(self, args: Mamba2Config, device: Device = None):
@@ -124,14 +135,6 @@ class Mamba2LMHeadModel(nn.Module):
         if h is None:
             h = [None for _ in range(self.args.n_layer)]
 
-            # Pad sequence to multiples of `chunk_size` for sequence parallelism in SSD
-            chunk_excess = seqlen % self.args.chunk_size
-            if chunk_excess != 0:
-                input_ids = cast(
-                    LongTensor,
-                    F.pad(input_ids, (0, self.args.chunk_size - chunk_excess)),
-                )
-
         x = self.backbone.embedding(input_ids)
         for i, layer in enumerate(self.backbone.layers):
             y, h[i] = layer.mixer(layer.norm(x), h[i])
@@ -144,15 +147,30 @@ class Mamba2LMHeadModel(nn.Module):
     def generate(
         self,
         input_ids: LongTensor,
-        initial_state: list[InferenceCache] | None = None,
         max_new_length: int = 20,
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 1.0,
         eos_token_id: int = 0,
     ) -> Iterable[tuple[int, list[InferenceCache]]]:
-        tokens = input_ids.unsqueeze(0)
-        h = initial_state
+        prefix, tokens = input_ids[:-1], input_ids[-1:].unsqueeze(0)
+
+        # Process prompt
+        # The input sequence to forward (non-inference path) must have length multiple that of chunk_size.
+        # We split out excess tokens so that n_chunked tokens can be processed by one forward call and
+        # process the rest in multiple inference steps.
+        n_chunked = (prefix.shape[0] // self.args.chunk_size) * self.args.chunk_size
+        if n_chunked > 0:
+            _, h = self(prefix[:n_chunked].unsqueeze(0), None)
+        else:
+            h = [
+                InferenceCache.alloc(1, self.args, device=self.device)
+                for _ in range(self.args.n_layer)
+            ]
+        for i in range(n_chunked, prefix.shape[0]):
+            _, h = self(prefix[i : i + 1].unsqueeze(0), h)
+
+        # Generate
         for _ in range(max_new_length):
             with torch.no_grad():
                 out, h = self(tokens, h)
@@ -207,7 +225,7 @@ class Mamba2(nn.Module):
     def forward(self, u: Tensor, h: InferenceCache | None = None):
         """
         Arguments
-            u: (batch, seqlen, d_model) input
+            u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
             h: hidden states for inference step. Initialized to 0s if not present.
 
         Return (y, h)
